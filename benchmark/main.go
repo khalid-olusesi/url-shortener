@@ -14,64 +14,74 @@ func main() {
 			return http.ErrUseLastResponse
 		},
 	}
+
+	const totalRequests = 1000
+	const concurrency = 100
+
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	var durations []time.Duration
+	var successful int
+	var failed int
 
 	start := time.Now()
 
-	var durations []time.Duration
+	semaphore := make(chan struct{}, concurrency)
 
-	var mu sync.Mutex
-
-	for i := 0; i < 100; i++ {
-
+	for i := 0; i < totalRequests; i++ {
 		wg.Add(1)
 
-		go func(i int) {
+		semaphore <- struct{}{}
+
+		go func() {
 			defer wg.Done()
-			fmt.Println("Request number:", i+1)
+			defer func() { <-semaphore }()
 
 			requestStart := time.Now()
 
-			resp, err := client.Get("http://localhost:8080/0KSEH5")
-
-			if err != nil {
-				fmt.Println("Request failed:", err)
-				return
-			}
+			resp, err := client.Get("http://localhost:8080/M829KTl2")
 
 			requestDuration := time.Since(requestStart)
+
 			mu.Lock()
+			defer mu.Unlock()
+
+			if err != nil {
+				failed++
+				return
+			}
+			defer resp.Body.Close()
+
 			durations = append(durations, requestDuration)
-			mu.Unlock()
-			fmt.Println("Status:", resp.StatusCode)
 
 			if resp.StatusCode == http.StatusFound {
-				fmt.Println("Redirect successful")
+				successful++
 			} else {
-				fmt.Println("Unexpected status code")
+				failed++
 			}
-
-			resp.Body.Close()
-		}(i)
+		}()
 	}
 
 	wg.Wait()
-	fmt.Println("Measurements recorded:", len(durations))
 
 	elapsed := time.Since(start)
-	fmt.Println("Total request duration:", elapsed)
 
 	var totalLatency time.Duration
-
 	for _, duration := range durations {
 		totalLatency += duration
 	}
+
+	fmt.Println("Total requests:", totalRequests)
+	fmt.Println("Successful redirects:", successful)
+	fmt.Println("Failed requests:", failed)
+	fmt.Println("Completed requests:", len(durations))
+	fmt.Println("Total duration:", elapsed)
 
 	if len(durations) > 0 {
 		averageLatency := totalLatency / time.Duration(len(durations))
 		fmt.Println("Average latency:", averageLatency)
 	}
 
-	requestsPerSecond := float64(len(durations)) / elapsed.Seconds()
-	fmt.Println("Requests per second:", requestsPerSecond)
+	fmt.Printf("Requests per second: %.2f\n", float64(len(durations))/elapsed.Seconds())
 }

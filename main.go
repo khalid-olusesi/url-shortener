@@ -23,7 +23,10 @@ func main() {
 		port = "8080"
 	}
 
-	router := gin.Default()
+	gin.SetMode(gin.ReleaseMode) //disables debug logging for better performance
+
+	router := gin.New()
+	router.Use(gin.Recovery()) //keeps crash protection without per-request logging
 
 	routes.UrlRoute(router)
 	router.Run(":" + port)

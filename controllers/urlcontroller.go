@@ -1,10 +1,10 @@
 package controllers
 
 import (
-	"context"
+	"crypto/rand"
 	"errors"
 	"log"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"net/url"
 	"time"
@@ -61,15 +61,27 @@ func CreateURL(c *gin.Context) {
 		return
 	}
 
-	for {
-		shortCode := generateShortCode()
+	const maxRetries = 10 //caps the collision retry loop to prevent infinite retries
+
+	for i := 0; i < maxRetries; i++ {
+		shortCode, err := generateShortCode()
+
+		if err != nil {
+			log.Printf("failed to generate shortcode:%v", err)
+
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "failed to gnerate shortcode",
+			})
+			return
+		}
 
 		genCode := models.URL{
 			OriginalURL: body.OriginalURL,
 			ShortCode:   shortCode,
+			ExpiresAt:   time.Now().AddDate(5, 0, 0), //sets the expiry to 5 years from now
 		}
 
-		results := initializers.DB.Save(&genCode)
+		results := initializers.DB.WithContext(c.Request.Context()).Create(&genCode)
 
 		if results.Error != nil {
 			var pgErr *pgconn.PgError
@@ -84,52 +96,69 @@ func CreateURL(c *gin.Context) {
 			return
 		}
 
+		//warm the redis cache so the first redirect is a cache hit
+		if initializers.RedisClient != nil {
+			cacheErr := initializers.RedisClient.Set(c.Request.Context(), "url:"+genCode.ShortCode, genCode.OriginalURL, time.Hour).Err()
+
+			if cacheErr != nil {
+				log.Printf("failed to warm cache: %v", cacheErr)
+			}
+		}
+
 		c.JSON(http.StatusCreated, gin.H{
 			"short_code": genCode.ShortCode,
 		})
 
-		break
+		return
 
-	} //the for loop added here gives me the chance to run indefinitely if there is a collision(same random code generated), till a unique one is formed again
+	} //the for loop caps at maxRetries to prevent infinite retries on collisions
+
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"error": "failed to generate a unique short code",
+	})
 
 }
 
-func generateShortCode() string {
+func generateShortCode() (string, error) {
 	const characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const codeLength = 8
 
-	shortCode := ""
+	shortCode := make([]byte, codeLength)
 
-	for i := 0; i < 6; i++ { //loops through for 6 indexes, terminates when it gets to index 6
-		index := rand.Intn(len(characters)) // generates 6 random indexes from the characters
+	for i := 0; i < codeLength; i++ {
+		index, err := rand.Int(rand.Reader, big.NewInt(int64(len(characters))))
+		if err != nil {
+			return "", err
+		}
 
-		shortCode = shortCode + string(characters[index]) //brings out the index charcaters of the random generated and shortcode is added for the string
+		shortCode[i] = characters[index.Int64()]
 	}
 
-	return shortCode
+	return string(shortCode), nil
 }
 
 func GetURL(c *gin.Context) {
 
 	shortcode := c.Param("shortcode") //retrieves the short code from the route(the one the user pastes)
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	if initializers.RedisClient != nil {
 		originalUrl, err := initializers.RedisClient.Get(ctx, "url:"+shortcode).Result()
-
-		if err != nil && !errors.Is(err, redis.Nil) {
-			log.Printf("redis lookup failed:%v", err)
-		}
 
 		if err == nil {
 			c.Redirect(http.StatusFound, originalUrl)
 			return
 		}
+
+		if !errors.Is(err, redis.Nil) {
+			log.Printf("redis lookup failed: %v", err) //only log actual redis errors, not cache misses
+		}
 	}
 
 	var url models.URL
 
-	results := initializers.DB.Where("short_code = ?", shortcode).First(&url)
+	results := initializers.DB.WithContext(ctx).Where("short_code = ?", shortcode).First(&url)
 
 	if errors.Is(results.Error, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{
@@ -141,6 +170,13 @@ func GetURL(c *gin.Context) {
 	if results.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "failed to retrieve the URL",
+		})
+		return
+	}
+
+	if !url.ExpiresAt.IsZero() && time.Now().After(url.ExpiresAt) {
+		c.JSON(http.StatusGone, gin.H{
+			"error": "this short url has expired",
 		})
 		return
 	}
@@ -158,3 +194,4 @@ func GetURL(c *gin.Context) {
 }
 
 //two important redis error, cache miss(the shortcode is not stored in redis) and redis failing
+//used hey as a lightweight load testing tool

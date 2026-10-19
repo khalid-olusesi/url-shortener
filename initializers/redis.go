@@ -33,6 +33,10 @@ func ConnectRedis() {
 
 	RedisClient = client
 
+	//configure redis LRU eviction policy so old keys get evicted when memory is full
+	client.ConfigSet(ctx, "maxmemory", "256mb")
+	client.ConfigSet(ctx, "maxmemory-policy", "allkeys-lru")
+
 	log.Println("connected to redis succesfully")
 }
 
